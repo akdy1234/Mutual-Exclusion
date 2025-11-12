@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"time"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -22,6 +21,7 @@ type Server struct {
 	Port	int
 	deferredReplies []string
 	RequestingCS bool
+	tempTime int64
 }
 
 func main() {
@@ -45,22 +45,20 @@ func main() {
 		RequestingCS: false,
 		ReplyCount: 0,
 		InCS:    false,
+		tempTime: 0,
 	}
-
 	go StartServer(s)
 	time.Sleep(2 * time.Second)
 
-	fmt.Println("Type Y when all 3 nodes are running...")
+	fmt.Println("Enter any key when all 3 nodes are running...")
 	fmt.Scanln()
 
 	for _, v := range array {
 		if !(v == port) {
 			arrayTwo[num] = v
 			num++
-			fmt.Println(v)
 		}
 	}
-
 if s.Id != "1" {
     conn1, err := grpc.Dial("localhost:8000", grpc.WithTransportCredentials(insecure.NewCredentials()))
     if err != nil {
@@ -82,19 +80,18 @@ if s.Id != "3" {
     }
     s.port2Id["3"] = proto.NewMutual_ExclusionClient(conn3)
 }
-
 	time.Sleep(2 * time.Second)
 	for {
 		var message string
-
 		fmt.Scanln(&message)
-
 		if message == "request" {
 			s.ReplyCount = 0
 			s.RequestingCS = true
+			s.lTime++
+			s.tempTime = s.lTime
 			for peerId, client := range s.port2Id {
         		if client != nil {
-					requestString, err := client.Request(context.Background(), &proto.AdminRequest{ClientId: s.Id, LogicalTime: s.lTime,})
+					requestString, err := client.Request(context.Background(), &proto.AdminRequest{ClientId: s.Id, LogicalTime: s.tempTime,})
 					if err != nil {
 						log.Printf("Error sending request to %s: %v", peerId, err)
 						continue
@@ -102,39 +99,44 @@ if s.Id != "3" {
 					if requestString.Reply {
 						s.ReplyCount++
 					}
+					log.Printf("updating logical time.")
+					log.Printf("before: %d", s.lTime)
 					s.lTime = max(s.lTime, requestString.LogicalTime) + 1
+					log.Printf("after: %d", s.lTime)
 				}
+				
 			}
-
+		
+			for s.ReplyCount < 2 {
+				time.Sleep(5 * time.Second)
+				log.Printf("Waiting for reply... (%d replies)", s.ReplyCount)
+				
+			}
+			log.Printf("%d replys recieved", s.ReplyCount)
+			
 			if s.ReplyCount == 2 {
 				log.Printf("Node %s entering critical section", Id)
 				s.InCS = true
-				time.Sleep(5 * time.Second)
-				log.Printf("Node %s exiting critical section", Id)
-				s.InCS = false
-				s.RequestingCS = false
-				for _, deferredId := range s.deferredReplies {
+			}
+		}
+		if message == "release" {
+			
+			log.Printf("Node %s exiting critical section", Id)
+			s.InCS = false
+			s.RequestingCS = false
+
+			for _, deferredId := range s.deferredReplies {
 					client := s.port2Id[deferredId]
 					client.SendReply(context.Background(), &proto.Reply{ClientId: s.Id, Reply: true, LogicalTime: s.lTime})
 					log.Printf("Node %s sent deferred reply to Node %s", s.Id, deferredId)
+					log.Printf("updating logical time.")
+					log.Printf("before: %d", s.lTime)
 					s.lTime++
+					log.Printf("after: %d", s.lTime)
 				}
 				s.deferredReplies = nil
-
-			}
+			
 		}
-
-		
-
-		/*if message == "release" {
-			s.lTime++
-			//releaseString, _ = client.Release(context.Background(), &proto.AdminRelease{Id: Id, LogicalTime: lTime})
-			client2.Release(context.Background(), &proto.AdminRelease{ClientId: s.Id, LogicalTime: s.lTime})
-			client3.Release(context.Background(), &proto.AdminRelease{ClientId: s.Id, LogicalTime: s.lTime})
-			s.ReplyCount = 0
-			//log.Printf("Response from server (RELEASE): %v", releaseString)
-			log.Printf("Node %s sent realease", s.Id)
-		}*/
 
 		
 	}
@@ -142,17 +144,19 @@ if s.Id != "3" {
 
 func (s *Server) Request(ctx context.Context, req *proto.AdminRequest) (*proto.Reply, error) {
 	log.Printf("Node %s received access request from Node %s", s.Id, req.ClientId)
-	
+
+	log.Printf("updating logical time.")
+	log.Printf("before: %d", s.lTime)
     s.lTime = max(s.lTime, req.LogicalTime) + 1
+	log.Printf("after: %d", s.lTime)
 
 	if s.InCS {
 		log.Printf("Node %s is currently in critical section, delaying reply to Node %s", s.Id, req.ClientId)
 		s.deferredReplies = append(s.deferredReplies, req.ClientId)
 		return &proto.Reply{ClientId: s.Id, Reply: false, LogicalTime: s.lTime}, nil
 	}
-
 	if s.RequestingCS {
-		if req.LogicalTime < s.lTime || (req.LogicalTime == s.lTime && req.ClientId < s.Id) {
+		if req.LogicalTime < s.tempTime || (req.LogicalTime == s.tempTime && req.ClientId < s.Id) {
 			log.Printf("Node %s is requesting critical section, but will reply to Node %s", s.Id, req.ClientId)
 		} else {
 			log.Printf("Node %s is requesting critical section, delaying reply to Node %s", s.Id, req.ClientId)
@@ -162,6 +166,17 @@ func (s *Server) Request(ctx context.Context, req *proto.AdminRequest) (*proto.R
 	}
 
 	return &proto.Reply{ClientId: s.Id, Reply: true, LogicalTime: s.lTime}, nil
+}
+
+func (s *Server) SendReply(ctx context.Context, rep *proto.Reply) (*proto.Empty, error) {
+	log.Printf("Node %s received reply from Node %s", s.Id, rep.ClientId)
+	
+	log.Printf("updating logical time.")
+	log.Printf("before: %d", s.lTime)
+    s.lTime = max(s.lTime, rep.LogicalTime) + 1
+	log.Printf("after: %d", s.lTime)
+	s.ReplyCount++
+	return &proto.Empty{}, nil
 }
 
 
