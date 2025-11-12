@@ -4,27 +4,13 @@ option go_package = "Chit_Chat/grpc/proto";
 
 message AdminRequest {
   string client_id = 1;
-  string content = 2;
-  int64 logical_time = 3;
-}
-
-message AdminRelease {
-  string client_id = 1;
-  string content = 2;
-  int64 logical_time = 3;
+  int64 logical_time = 2;
 }
 
 message Reply {
-  string cleint_id = 1;
+  string client_id = 1;
   bool reply = 2;
   int64 logical_time = 3;
-}
-
-message ack {
-  bool success = 1;
-  string error = 2;
-  int64 logical_time = 3;
-
 }
 
 message empty {
@@ -35,6 +21,6 @@ service Mutual_Exclusion {
 
   rpc Request(AdminRequest) returns (Reply);
 
-  rpc Release(AdminRelease) returns (Reply);
+  rpc SendReply(Reply) returns (empty);
 
 }

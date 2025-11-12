@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"time"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -15,8 +14,14 @@ import (
 type Server struct {
 	proto.UnimplementedMutual_ExclusionServer
 	Id      string
-	time2Id map[int64]string
+	port2Id map[string]proto.Mutual_ExclusionClient
 	lTime   int64
+	ReplyCount int
+	InCS    bool
+	Port	int
+	deferredReplies []string
+	RequestingCS bool
+	tempTime int64
 }
 
 func main() {
@@ -31,139 +36,161 @@ func main() {
 	array := []int{8000, 8001, 8002}
 	var arrayTwo [2]int = [2]int{}
 	var num int = 0
-
-	go StartServer(Id, port)
+	s := &Server{
+		Id:      Id,
+		Port:    port,
+		lTime:   0,
+		port2Id: make(map[string]proto.Mutual_ExclusionClient),
+		deferredReplies: []string{},
+		RequestingCS: false,
+		ReplyCount: 0,
+		InCS:    false,
+		tempTime: 0,
+	}
+	go StartServer(s)
 	time.Sleep(2 * time.Second)
 
-	fmt.Println("Type Y when all 3 nodes are running...")
+	fmt.Println("Enter any key when all 3 nodes are running...")
 	fmt.Scanln()
 
 	for _, v := range array {
 		if !(v == port) {
 			arrayTwo[num] = v
 			num++
-			fmt.Println(v)
 		}
 	}
-
-	address := fmt.Sprintf("localhost:%d", port)
-	address2 := fmt.Sprintf("localhost:%d", arrayTwo[0])
-	address3 := fmt.Sprintf("localhost:%d", arrayTwo[1])
-
-	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("could not connect: %v", err)
-	}
-
-	conn2, err := grpc.NewClient(address2, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("could not connect: %v", err)
-	}
-
-	conn3, err := grpc.NewClient(address3, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("could not connect: %v", err)
-	}
-
-	client := proto.NewMutual_ExclusionClient(conn)
-	client2 := proto.NewMutual_ExclusionClient(conn2)
-	client3 := proto.NewMutual_ExclusionClient(conn3)
-
-	var lTime int64
-
+if s.Id != "1" {
+    conn1, err := grpc.Dial("localhost:8000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+    if err != nil {
+        log.Fatalf("Could not connect to 1: %v", err)
+    }
+    s.port2Id["1"] = proto.NewMutual_ExclusionClient(conn1)
+}
+if s.Id != "2" {
+    conn2, err := grpc.Dial("localhost:8001", grpc.WithTransportCredentials(insecure.NewCredentials()))
+    if err != nil {
+        log.Fatalf("Could not connect to 2: %v", err)
+    }
+    s.port2Id["2"] = proto.NewMutual_ExclusionClient(conn2)
+}
+if s.Id != "3" {
+    conn3, err := grpc.Dial("localhost:8002", grpc.WithTransportCredentials(insecure.NewCredentials()))
+    if err != nil {
+        log.Fatalf("Could not connect to 3: %v", err)
+    }
+    s.port2Id["3"] = proto.NewMutual_ExclusionClient(conn3)
+}
 	time.Sleep(2 * time.Second)
 	for {
 		var message string
-		var requestString *proto.Reply
-		var releaseString *proto.Reply
-
 		fmt.Scanln(&message)
-
 		if message == "request" {
-			requestString, _ = client.Request(context.Background(), &proto.AdminRequest{Id: Id, LogicalTime: lTime})
-			requestString, _ = client2.Request(context.Background(), &proto.AdminRequest{Id: Id, LogicalTime: lTime})
-			requestString, _ = client3.Request(context.Background(), &proto.AdminRequest{Id: Id, LogicalTime: lTime})
-			log.Printf("1Response from server (REQUEST): %v", requestString)
-
+			s.ReplyCount = 0
+			s.RequestingCS = true
+			s.lTime++
+			s.tempTime = s.lTime
+			for peerId, client := range s.port2Id {
+        		if client != nil {
+					requestString, err := client.Request(context.Background(), &proto.AdminRequest{ClientId: s.Id, LogicalTime: s.tempTime,})
+					if err != nil {
+						log.Printf("Error sending request to %s: %v", peerId, err)
+						continue
+					}
+					if requestString.Reply {
+						s.ReplyCount++
+					}
+					log.Printf("updating logical time.")
+					log.Printf("before: %d", s.lTime)
+					s.lTime = max(s.lTime, requestString.LogicalTime) + 1
+					log.Printf("after: %d", s.lTime)
+				}
+				
+			}
+		
+			for s.ReplyCount < 2 {
+				time.Sleep(5 * time.Second)
+				log.Printf("Waiting for reply... (%d replies)", s.ReplyCount)
+				
+			}
+			log.Printf("%d replys recieved", s.ReplyCount)
+			
+			if s.ReplyCount == 2 {
+				log.Printf("Node %s entering critical section", Id)
+				s.InCS = true
+			}
 		}
 		if message == "release" {
-			lTime++
-			releaseString, _ = client.Release(context.Background(), &proto.AdminRelease{Id: Id, LogicalTime: lTime})
-			releaseString, _ = client2.Release(context.Background(), &proto.AdminRelease{Id: Id, LogicalTime: lTime})
-			releaseString, _ = client3.Release(context.Background(), &proto.AdminRelease{Id: Id, LogicalTime: lTime})
-			log.Printf("1Response from server (RELAESE): %v", releaseString)
+			
+			log.Printf("Node %s exiting critical section", Id)
+			s.InCS = false
+			s.RequestingCS = false
+
+			for _, deferredId := range s.deferredReplies {
+					client := s.port2Id[deferredId]
+					client.SendReply(context.Background(), &proto.Reply{ClientId: s.Id, Reply: true, LogicalTime: s.lTime})
+					log.Printf("Node %s sent deferred reply to Node %s", s.Id, deferredId)
+					log.Printf("updating logical time.")
+					log.Printf("before: %d", s.lTime)
+					s.lTime++
+					log.Printf("after: %d", s.lTime)
+				}
+				s.deferredReplies = nil
+			
 		}
 
+		
 	}
-
 }
 
 func (s *Server) Request(ctx context.Context, req *proto.AdminRequest) (*proto.Reply, error) {
-	log.Printf("Node %s received access request from Node %s", s.Id, req.Id)
+	log.Printf("Node %s received access request from Node %s", s.Id, req.ClientId)
 
-	s.lTime++
+	log.Printf("updating logical time.")
+	log.Printf("before: %d", s.lTime)
+    s.lTime = max(s.lTime, req.LogicalTime) + 1
+	log.Printf("after: %d", s.lTime)
 
-	first := true
-	s.time2Id[int64(req.LogicalTime)] = string(s.Id)
-	var lowest int64 = 1000000
-	for num := range s.time2Id {
-		if first || num < lowest {
-			first = false
-			lowest = num
-		} else if num == lowest {
-			log.Printf("åh nejjjjjjjjj ")
-			log.Printf("%d", num)
+	if s.InCS {
+		log.Printf("Node %s is currently in critical section, delaying reply to Node %s", s.Id, req.ClientId)
+		s.deferredReplies = append(s.deferredReplies, req.ClientId)
+		return &proto.Reply{ClientId: s.Id, Reply: false, LogicalTime: s.lTime}, nil
+	}
+	if s.RequestingCS {
+		if req.LogicalTime < s.tempTime || (req.LogicalTime == s.tempTime && req.ClientId < s.Id) {
+			log.Printf("Node %s is requesting critical section, but will reply to Node %s", s.Id, req.ClientId)
+		} else {
+			log.Printf("Node %s is requesting critical section, delaying reply to Node %s", s.Id, req.ClientId)
+			s.deferredReplies = append(s.deferredReplies, req.ClientId)
+			return &proto.Reply{ClientId: s.Id, Reply: false, LogicalTime: s.lTime}, nil
 		}
-		value := s.time2Id[num]
-		log.Printf("time: %d id: %s", num, value)
 	}
-	log.Printf("lowest: %d", lowest)
 
-	// Implement your access request handling logic here
-
-	return &proto.Reply{Id: s.Id, Reply: true, LogicalTime: time.Now().Unix()}, nil
+	return &proto.Reply{ClientId: s.Id, Reply: true, LogicalTime: s.lTime}, nil
 }
 
-func (s *Server) Release(ctx context.Context, req *proto.AdminRelease) (*proto.Reply, error) {
-	log.Printf("Node %s received release access from Node %s", s.Id, req.Id)
-	// Implement your release access handling logic here
-
-	return &proto.Reply{Id: s.Id, Reply: true, LogicalTime: time.Now().Unix()}, nil
+func (s *Server) SendReply(ctx context.Context, rep *proto.Reply) (*proto.Empty, error) {
+	log.Printf("Node %s received reply from Node %s", s.Id, rep.ClientId)
+	
+	log.Printf("updating logical time.")
+	log.Printf("before: %d", s.lTime)
+    s.lTime = max(s.lTime, rep.LogicalTime) + 1
+	log.Printf("after: %d", s.lTime)
+	s.ReplyCount++
+	return &proto.Empty{}, nil
 }
 
-func sendRequest(target string, fromID string) {
-	conn, err := grpc.Dial(target, grpc.WithInsecure())
-	if err != nil {
-		log.Fatalf("Did not connect: %v", err)
-	}
-	defer conn.Close()
 
-	c := proto.NewMutual_ExclusionClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+func StartServer(s *Server) {
+    lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", s.Port))
+    if err != nil {
+        log.Fatalf("Failed to listen on port %d: %v", s.Port, err)
+    }
 
-	req := &proto.AdminRequest{Id: fromID, LogicalTime: time.Now().Unix()}
+    grpcServer := grpc.NewServer()
+    proto.RegisterMutual_ExclusionServer(grpcServer, s)
+    log.Printf("[%s] gRPC server started on port %d", s.Id, s.Port)
 
-	reply, err := c.Request(ctx, req)
-	if err != nil {
-		log.Printf("Could not send request to %s: %v", target, err)
-		return
-	}
-
-	log.Printf("[%s] Got reply from %s: ok=%v", fromID, target, reply.Reply)
-}
-
-func StartServer(Id string, port int) {
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		log.Fatalf("Failed to listen on port %d: %v", port, err)
-	}
-
-	grpcServer := grpc.NewServer()
-	proto.RegisterMutual_ExclusionServer(grpcServer, &Server{Id: Id})
-
-	log.Printf("Node: %s listening on port: %d", Id, port)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
-	}
+    if err := grpcServer.Serve(lis); err != nil {
+        log.Fatalf("Failed to serve: %v", err)
+    }
 }
